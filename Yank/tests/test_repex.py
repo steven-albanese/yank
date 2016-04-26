@@ -26,6 +26,8 @@ import scipy.integrate
 import simtk.openmm as openmm
 import simtk.unit as units
 
+from nose import tools
+
 from openmmtools import testsystems
 
 from yank.repex import ThermodynamicState, ReplicaExchange, HamiltonianExchange, ParallelTempering
@@ -177,7 +179,10 @@ def test_replica_exchange(mpicomm=None, verbose=True):
     simulation.online_analysis = True
 
     # Run simulation.
+    from yank import utils
+    utils.config_root_logger(False)
     simulation.run() # run the simulation
+    utils.config_root_logger(True)
 
     # Stop here if not root node.
     if mpicomm and (mpicomm.rank != 0): return
@@ -207,7 +212,7 @@ def test_replica_exchange(mpicomm=None, verbose=True):
         print "nsigma"
         print nsigma
         raise Exception("Dimensionless free energy differences between online and final analysis exceeds MAX_SIGMA of %.1f" % MAX_SIGMA)
-    
+
     # TODO: Check if deviations exceed tolerance.
     Delta_f_ij = analysis['Delta_f_ij']
     dDelta_f_ij = analysis['dDelta_f_ij']
@@ -341,7 +346,10 @@ def test_hamiltonian_exchange(mpicomm=None, verbose=True):
     simulation.show_mixing_statistics = False
 
     # Run simulation.
+    from yank import utils
+    utils.config_root_logger(True)
     simulation.run() # run the simulation
+    utils.config_root_logger(False)
 
     # Stop here if not root node.
     if mpicomm and (mpicomm.rank != 0): return
@@ -387,6 +395,17 @@ def test_hamiltonian_exchange(mpicomm=None, verbose=True):
     if verbose: print "PASSED."
     return
 
+def test_parameters():
+    """Test ReplicaExchange parameters initialization."""
+    repex = ReplicaExchange(store_filename='test', nsteps_per_iteration=1e6)
+    assert repex.nsteps_per_iteration == 1000000
+    assert repex.collision_rate == repex.default_parameters['collision_rate']
+
+@tools.raises(TypeError)
+def test_unknown_parameters():
+    """Test ReplicaExchange raises exception on wrong initialization."""
+    ReplicaExchange(store_filename='test', wrong_parameter=False)
+
 #=============================================================================================
 # MAIN AND TESTS
 #=============================================================================================
@@ -394,7 +413,7 @@ def test_hamiltonian_exchange(mpicomm=None, verbose=True):
 if __name__ == "__main__":
     # Configure logger.
     from yank import utils
-    utils.config_root_logger(True, log_file_path='debug.log')
+    utils.config_root_logger(False)
 
     # Try MPI, if possible.
     try:

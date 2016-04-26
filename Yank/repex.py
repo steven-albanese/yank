@@ -59,8 +59,7 @@ This code is licensed under the latest available version of the GNU General Publ
 from simtk import openmm
 from simtk import unit
 
-import os
-import sys
+import os, os.path
 import math
 import copy
 import time
@@ -467,10 +466,25 @@ class ReplicaExchange(object):
        Number of equilibration iterations before beginning exchanges (default: 0)
     equilibration_timestep : simtk.unit.Quantity (units: time)
        Timestep for use in equilibration (default: 2 fs)
+    title : str
+       Title for the simulation.
+    minimize : bool
+       Minimize configurations before running the simulation (default: True)
+    minimize_tolerance : simtk.unit.Quantity (units: energy/mole/length)
+       Set minimization tolerance (default: 1.0 * unit.kilojoules_per_mole / unit.nanometers).
+    minimize_max_iterations : int
+       Maximum number of iterations for minimization.
     replica_mixing_scheme : str
-       Scheme used to swap replicas: 'swap-all' or 'swap-neighbors' (default: 'swap-all')
+       Specify how to mix replicas. Supported schemes are 'swap-neighbors' and
+       'swap-all' (default: 'swap-all').
     online_analysis : bool
-       If True, analysis will occur each iteration (default: False)
+       If True, analysis will occur each iteration (default: False).
+    online_analysis_min_iterations : int
+       Minimum number of iterations needed to begin online analysis (default: 20).
+    show_energies : bool
+       If True, will print energies at each iteration (default: True).
+    show_mixing_statistics : bool
+       If True, will show mixing statistics at each iteration (default: True).
 
     TODO
     ----
@@ -497,7 +511,7 @@ class ReplicaExchange(object):
     >>> T_i = [ T_min + (T_max - T_min) * (math.exp(float(i) / float(nreplicas-1)) - 1.0) / (math.e - 1.0) for i in range(nreplicas) ]
     >>> states = [ ThermodynamicState(system=system, temperature=T_i[i]) for i in range(nreplicas) ]
     >>> import tempfile
-    >>> store_filename = tempfile.NamedTemporaryFile().name + '.nc'
+    >>> store_filename = tempfile.NamedTemporaryFile(delete=False).name + '.nc'
     >>> # Create simulation.
     >>> simulation = ReplicaExchange(store_filename)
     >>> simulation.create(states, positions) # initialize the replica-exchange simulation
@@ -515,12 +529,34 @@ class ReplicaExchange(object):
     >>> simulation.number_of_iterations = 4 # extend
     >>> simulation.run()
 
+    Clean up.
+
+    >>> os.remove(store_filename)
+
     """
+
+    default_parameters = {'collision_rate': 5.0 / unit.picosecond,
+                          'constraint_tolerance': 1.0e-6,
+                          'timestep': 2.0 * unit.femtosecond,
+                          'nsteps_per_iteration': 500,
+                          'number_of_iterations': 1,
+                          'equilibration_timestep': 1.0 * unit.femtosecond,
+                          'number_of_equilibration_iterations': 1,
+                          'title': 'Replica-exchange simulation created using ReplicaExchange class of repex.py on %s' % time.asctime(time.localtime()),
+                          'minimize': True,
+                          'minimize_tolerance': 1.0 * unit.kilojoules_per_mole / unit.nanometers,
+                          'minimize_max_iterations': 0,
+                          'replica_mixing_scheme': 'swap-all',
+                          'online_analysis': False,
+                          'online_analysis_min_iterations': 20,
+                          'show_energies': True,
+                          'show_mixing_statistics': True
+                          }
 
     # Options to store.
     options_to_store = ['collision_rate', 'constraint_tolerance', 'timestep', 'nsteps_per_iteration', 'number_of_iterations', 'equilibration_timestep', 'number_of_equilibration_iterations', 'title', 'minimize', 'replica_mixing_scheme', 'online_analysis', 'show_mixing_statistics']
 
-    def __init__(self, store_filename, mpicomm=None, mm=None):
+    def __init__(self, store_filename, mpicomm=None, mm=None, **kwargs):
         """
         Initialize replica-exchange simulation facility.
 
@@ -532,6 +568,11 @@ class ReplicaExchange(object):
            OpenMM API implementation to use
         mpicomm : mpi4py communicator, optional, default=None
            MPI communicator, if parallel execution is desired
+
+        Other Parameters
+        ----------------
+        **kwargs
+            Parameters in ReplicaExchange.default_parameters corresponding public attributes.
 
         """
         # To allow for parameters to be modified after object creation, class is not initialized until a call to self._initialize().
@@ -546,32 +587,26 @@ class ReplicaExchange(object):
 
         # Set default options.
         # These can be changed externally until object is initialized.
-        self.collision_rate = 5.0 / unit.picosecond
-        self.constraint_tolerance = 1.0e-6
-        self.timestep = 2.0 * unit.femtosecond
-        self.nsteps_per_iteration = 500
-        self.number_of_iterations = 1
-        self.equilibration_timestep = 1.0 * unit.femtosecond
-        self.number_of_equilibration_iterations = 1
-        self.title = 'Replica-exchange simulation created using ReplicaExchange class of repex.py on %s' % time.asctime(time.localtime())
-        self.minimize = True
-        self.minimize_tolerance = 1.0 * unit.kilojoules_per_mole / unit.nanometers # if specified, set minimization tolerance
-        self.minimize_maxIterations = 0 # if nonzero, set maximum iterations
         self.platform = None
         self.platform_name = None
         self.integrator = None # OpenMM integrator to use for propagating dynamics
-        self.replica_mixing_scheme = 'swap-all' # mix all replicas thoroughly
-        self.online_analysis = False # if True, analysis will occur each iteration
-        self.online_analysis_min_iterations = 20 # minimum number of iterations needed to begin online analysis, if requested
-        self.show_energies = True
-        self.show_mixing_statistics = True
+
+        # Initialize keywords parameters and check for unknown keywords parameters
+        for par, default in self.default_parameters.items():
+            setattr(self, par, kwargs.pop(par, default))
+        if kwargs:
+            raise TypeError('got an unexpected keyword arguments {}'.format(
+                ', '.join(kwargs.keys())))
 
         # Record store file filename
         self.store_filename = store_filename
 
         # Check if netcdf file exists, assuming we want to resume if one exists.
         self._resume = os.path.exists(self.store_filename) and (os.path.getsize(self.store_filename) > 0)
-        if self.mpicomm: self._resume = self.mpicomm.bcast(self._resume, root=0) # use whatever root node decides
+        if self.mpicomm:
+            logger.debug('Node {}/{}: MPI bcast - sharing self._resume'.format(
+                    self.mpicomm.rank, self.mpicomm.size))
+            self._resume = self.mpicomm.bcast(self._resume, root=0)  # use whatever root node decides
 
         return
 
@@ -599,9 +634,12 @@ class ReplicaExchange(object):
 
         # Check if netcdf file exists.
         file_exists = os.path.exists(self.store_filename) and (os.path.getsize(self.store_filename) > 0)
-        if self.mpicomm: file_exists= self.mpicomm.bcast(file_exists, root=0) # use whatever root node decides
+        if self.mpicomm:
+            logger.debug('Node {}/{}: MPI bcast - sharing file_exists'.format(
+                    self.mpicomm.rank, self.mpicomm.size))
+            file_exists = self.mpicomm.bcast(file_exists, root=0)  # use whatever root node decides
         if file_exists:
-            raise Exception("NetCDF file %s already exists; cowardly refusing to overwrite." % self.store_filename)
+            raise RuntimeError("NetCDF file %s already exists; cowardly refusing to overwrite." % self.store_filename)
         self._resume = False
 
         # TODO: Make a deep copy of specified states once this is fixed in OpenMM.
@@ -652,7 +690,10 @@ class ReplicaExchange(object):
 
         # Check if netcdf file exists.
         file_exists = os.path.exists(self.store_filename) and (os.path.getsize(self.store_filename) > 0)
-        if self.mpicomm: file_exists= self.mpicomm.bcast(file_exists, root=0) # use whatever root node decides
+        if self.mpicomm:
+            logger.debug('Node {}/{}: MPI bcast - sharing file_exists'.format(
+                    self.mpicomm.rank, self.mpicomm.size))
+            file_exists = self.mpicomm.bcast(file_exists, root=0)  # use whatever root node decides
         if not file_exists:
             raise Exception("NetCDF file %s does not exist; cannot resume." % self.store_filename)
 
@@ -660,6 +701,7 @@ class ReplicaExchange(object):
         ncfile = netcdf.Dataset(self.store_filename, 'r')
         self._restore_thermodynamic_states(ncfile)
         self._restore_options(ncfile)
+        self._restore_metadata(ncfile)
         ncfile.close()
 
         # Determine number of replicas from the number of specified thermodynamic states.
@@ -1151,7 +1193,7 @@ class ReplicaExchange(object):
         integrator_end_time = time.time()
         # Store final positions
         getstate_start_time = time.time()
-        openmm_state = context.getState(getPositions=True)
+        openmm_state = context.getState(getPositions=True,enforcePeriodicBox=True)
         getstate_end_time = time.time()
         self.replica_positions[replica_index] = openmm_state.getPositions(asNumpy=True)
         # Store box vectors.
@@ -1200,7 +1242,7 @@ class ReplicaExchange(object):
         elapsed_time = end_time - start_time
         # Collect elapsed time.
         node_elapsed_times = self.mpicomm.gather(elapsed_time, root=0) # barrier
-        if logger.isEnabledFor(logging.DEBUG):
+        if self.mpicomm.rank == 0 and logger.isEnabledFor(logging.DEBUG):
             node_elapsed_times = np.array(node_elapsed_times)
             end_time = time.time()
             elapsed_time = end_time - start_time
@@ -1278,9 +1320,9 @@ class ReplicaExchange(object):
         positions = self.replica_positions[replica_index]
         context.setPositions(positions)
         # Minimize energy.
-        minimized_positions = self.mm.LocalEnergyMinimizer.minimize(context, self.minimize_tolerance, self.minimize_maxIterations)
+        minimized_positions = self.mm.LocalEnergyMinimizer.minimize(context, self.minimize_tolerance, self.minimize_max_iterations)
         # Store final positions
-        self.replica_positions[replica_index] = context.getState(getPositions=True).getPositions(asNumpy=True)
+        self.replica_positions[replica_index] = context.getState(getPositions=True,enforcePeriodicBox=True).getPositions(asNumpy=True)
         # Clean up.
         del integrator, context
 
@@ -1305,6 +1347,8 @@ class ReplicaExchange(object):
                     logger.debug("node %d / %d : minimizing replica %d / %d" % (self.mpicomm.rank, self.mpicomm.size, replica_index, self.nstates))
                     self._minimize_replica(replica_index)
                 end_time = time.time()
+                debug_msg = 'Node {}/{}: MPI barrier'.format(self.mpicomm.rank, self.mpicomm.size)
+                logger.debug(debug_msg + ' - waiting for the minimization to be completed.')
                 self.mpicomm.barrier()
                 logger.debug("Running trajectories: elapsed time %.3f s" % (end_time - start_time))
 
@@ -1503,6 +1547,8 @@ class ReplicaExchange(object):
 
         if (self.mpicomm) and (self.mpicomm.rank != 0):
             # Non-root nodes receive state information.
+            logger.debug('Node {}/{}: MPI bcast - sharing replica_states'.format(
+                    self.mpicomm.rank, self.mpicomm.size))
             self.replica_states = self.mpicomm.bcast(self.replica_states, root=0)
             return
 
@@ -1553,7 +1599,8 @@ class ReplicaExchange(object):
 
         if self.mpicomm:
             # Root node will share state information with all replicas.
-            logger.debug("Sharing state information...")
+            logger.debug('Node {}/{}: MPI bcast - sharing replica_states'.format(
+                    self.mpicomm.rank, self.mpicomm.size))
             self.replica_states = self.mpicomm.bcast(self.replica_states, root=0)
 
         # Report on mixing.
@@ -1612,6 +1659,8 @@ class ReplicaExchange(object):
 
         if self.iteration < 2:
             return
+        if self.mpicomm and self.mpicomm.rank != 0:
+            return  # only root node have access to ncfile
         if not logger.isEnabledFor(logging.DEBUG):
             return
 
@@ -1713,7 +1762,7 @@ class ReplicaExchange(object):
 
         # Store metadata.
         if self.metadata:
-            self._store_metadata(ncfile, 'metadata', self.metadata)
+            self._store_metadata(ncfile)
 
         # Force sync to disk to avoid data loss.
         ncfile.sync()
@@ -1894,6 +1943,126 @@ class ReplicaExchange(object):
 
         return True
 
+    def _store_dict_in_netcdf(self, ncgrp, options):
+        """
+        Store the contents of a dict in a NetCDF file.
+
+        Parameters
+        ----------
+        ncgrp : ncfile.Dataset group
+            The group in which to store options.
+        options : dict
+            The dict to store.
+
+        """
+        from utils import typename
+        import collections
+        for option_name in options.keys():
+            # Get option value.
+            option_value = options[option_name]
+            # If Quantity, strip off units first.
+            option_unit = None
+            if type(option_value) == unit.Quantity:
+                option_unit = option_value.unit
+                option_value = option_value / option_unit
+            # Store the Python type.
+            option_type = type(option_value)
+            option_type_name = typename(option_type)
+            # Handle booleans
+            if type(option_value) == bool:
+                option_value = int(option_value)
+            # Store the variable.
+            if type(option_value) == str:
+                logger.debug("Storing option: %s -> %s (type: %s)" % (option_name, option_value, option_type_name))
+                ncvar = ncgrp.createVariable(option_name, type(option_value), 'scalar')
+                packed_data = np.empty(1, 'O')
+                packed_data[0] = option_value
+                ncvar[:] = packed_data
+                setattr(ncvar, 'type', option_type_name)
+            elif isinstance(option_value, collections.Iterable):
+                nelements = len(option_value)
+                logger.debug("Storing option: %s -> %s (type: %s, array of length %d)" % (option_name, option_value, option_type_name, nelements))
+                element_type = type(option_value[0])
+                element_type_name = typename(element_type)
+                ncgrp.createDimension(option_name, nelements) # unlimited number of iterations
+                ncvar = ncgrp.createVariable(option_name, element_type, (option_name,))
+                for (i, element) in enumerate(option_value):
+                    ncvar[i] = element
+                setattr(ncvar, 'type', element_type_name)
+            elif option_value is None:
+                logger.debug("Storing option: %s -> %s (None)" % (option_name, option_value))
+                ncvar = ncgrp.createVariable(option_name, int)
+                ncvar.assignValue(0)
+                setattr(ncvar, 'type', option_type_name)
+            else:
+                logger.debug("Storing option: %s -> %s (type: %s, other)" % (option_name, option_value, option_type_name))
+                ncvar = ncgrp.createVariable(option_name, type(option_value))
+                ncvar.assignValue(option_value)
+                setattr(ncvar, 'type', option_type_name)
+            if option_unit: setattr(ncvar, 'units', str(option_unit))
+
+        return
+
+    def _restore_dict_from_netcdf(self, ncgrp):
+        """
+        Restore dict from NetCDF.
+
+        Parameters
+        ----------
+        ncgrp : netcdf.Dataset group
+            The NetCDF group to restore from.
+
+        Returns
+        -------
+        options : dict
+            The restored options as a dict.
+
+        """
+        options = dict()
+
+        import numpy
+        for option_name in ncgrp.variables.keys():
+            # Get NetCDF variable.
+            option_ncvar = ncgrp.variables[option_name]
+            type_name = getattr(option_ncvar, 'type')
+            # Get option value.
+            if type_name == 'NoneType':
+                option_value = None
+                logger.debug("Restoring option: %s -> %s (None)" % (option_name, str(option_value)))
+            elif option_ncvar.shape == ():
+                option_value = option_ncvar.getValue()
+                # Cast to python types.
+                if type_name == 'bool':
+                    option_value = bool(option_value)
+                elif type_name == 'int':
+                    option_value = int(option_value)
+                elif type_name == 'float':
+                    option_value = float(option_value)
+                elif type_name == 'str':
+                    option_value = str(option_value)
+                logger.debug("Restoring option: %s -> %s (type: %s)" % (option_name, str(option_value), type(option_value)))
+            elif (option_ncvar.shape[0] >= 0):
+                option_value = np.array(option_ncvar[:], eval(type_name))
+                # TODO: Deal with values that are actually scalar constants.
+                # TODO: Cast to appropriate type
+                logger.debug("Restoring option: %s -> %s (type: %s)" % (option_name, str(option_value), type(option_value)))
+            else:
+                option_value = option_ncvar[0]
+                option_value = eval(type_name + '(' + repr(option_value) + ')')
+                logger.debug("Restoring option: %s -> %s (type: %s)" % (option_name, str(option_value), type(option_value)))
+
+            # If Quantity, assign unit.
+            if hasattr(option_ncvar, 'units'):
+                option_unit_name = getattr(option_ncvar, 'units')
+                if option_unit_name[0] == '/':
+                    option_value = eval(str(option_value) + option_unit_name, unit.__dict__)
+                else:
+                    option_value = eval(str(option_value) + '*' + option_unit_name, unit.__dict__)
+            # Store option.
+            options[option_name] = option_value
+
+        return options
+
     def _store_options(self, ncfile):
         """
         Store run parameters in NetCDF file.
@@ -1909,53 +2078,21 @@ class ReplicaExchange(object):
         # Create a group to store state information.
         ncgrp_options = ncfile.createGroup('options')
 
-        # Store run parameters.
+        # Build dict of options to store.
+        options = dict()
         for option_name in self.options_to_store:
-            # Get option value.
             option_value = getattr(self, option_name)
-            # If Quantity, strip off units first.
-            option_unit = None
-            if type(option_value) == unit.Quantity:
-                option_unit = option_value.unit
-                option_value = option_value / option_unit
-            # Store the Python type.
-            option_type = type(option_value)
-            # Handle booleans
-            if type(option_value) == bool:
-                option_value = int(option_value)
-            # Store the variable.
-            logger.debug("Storing option: %s -> %s (type: %s)" % (option_name, option_value, str(option_type)))
-            if type(option_value) == str:
-                ncvar = ncgrp_options.createVariable(option_name, type(option_value), 'scalar')
-                packed_data = np.empty(1, 'O')
-                packed_data[0] = option_value
-                ncvar[:] = packed_data
-                setattr(ncvar, 'type', option_type.__name__)
-            elif hasattr(option_value, '__getitem__'):
-                nelements = len(option_value)
-                ncgrp_options.createDimension(option_name, nelements) # unlimited number of iterations
-                ncvar = ncgrp_options.createVariable(option_name, type(option_value[0]), (option_name,))
-                for (i, element) in enumerate(option_value):
-                    ncvar[i] = element
-                option_type = type(option_value[0])
-                setattr(ncvar, 'type', option_type.__name__)
-            elif option_value is None:
-                ncvar = ncgrp_options.createVariable(option_name, int)
-                ncvar.assignValue(0)
-                setattr(ncvar, 'type', option_type.__name__)
-            else:
-                ncvar = ncgrp_options.createVariable(option_name, type(option_value))
-                ncvar.assignValue(option_value)
-                setattr(ncvar, 'type', option_type.__name__)
-            if option_unit: setattr(ncvar, 'units', str(option_unit))
+            options[option_name] = option_value
+
+        # Store options.
+        self._store_dict_in_netcdf(ncgrp_options, options)
 
         return
-
-
 
     def _restore_options(self, ncfile):
         """
         Restore run parameters from NetCDF file.
+
         """
 
         logger.debug("Attempting to restore options from NetCDF file...")
@@ -1967,62 +2104,54 @@ class ReplicaExchange(object):
         # Find the group.
         ncgrp_options = ncfile.groups['options']
 
-        # Load run parameters.
-        for option_name in ncgrp_options.variables.keys():
-            # Get NetCDF variable.
-            option_ncvar = ncgrp_options.variables[option_name]
-            type_name = getattr(option_ncvar, 'type')
-            # Get option value.
-            if type_name == 'NoneType':
-                option_value = None
-            elif option_ncvar.shape == ():
-                option_value = option_ncvar.getValue()
-                # Cast to python types.
-                if type(option_value) in [np.int32, np.int64]:
-                    option_value = int(option_value)
-                if type(option_value) in [np.float32, np.float64]:
-                    option_value = float(option_value)
-            elif (option_ncvar.shape[0] > 1):
-                option_value = np.array(option_ncvar[:], type_name)
-            else:
-                option_value = option_ncvar[0]
-                option_value = eval(type_name + '(' + repr(option_value) + ')')
-            # If Quantity, assign unit.
-            if hasattr(option_ncvar, 'units'):
-                option_unit_name = getattr(option_ncvar, 'units')
-                if option_unit_name[0] == '/':
-                    option_value = eval(str(option_value) + option_unit_name, unit.__dict__)
-                else:
-                    option_value = eval(str(option_value) + '*' + option_unit_name, unit.__dict__)
-            # Store option.
-            logger.debug("Restoring option: %s -> %s (type: %s)" % (option_name, str(option_value), type(option_value)))
-            setattr(self, option_name, option_value)
+        # Restore options as dict.
+        options = self._restore_dict_from_netcdf(ncgrp_options)
+
+        # Set these as attributes.
+        for option_name in options.keys():
+            setattr(self, option_name, options[option_name])
 
         # Signal success.
         return True
 
-    def _store_metadata(self, ncfile, groupname, metadata):
+    def _store_metadata(self, ncfile):
         """
         Store metadata in NetCDF file.
 
+        Parameters
+        ----------
+        ncfile : netcdf.Dataset
+            The NetCDF file in which metadata is to be stored.
+
         """
-
-        # Create group.
-        ncgrp = ncfile.createGroup(groupname)
-
-        # Store metadata.
-        for (key, value) in metadata.iteritems():
-            # TODO: Handle more sophisticated types.
-            ncvar = ncgrp.createVariable(key, type(value))
-            ncvar.assignValue(value)
-
+        ncgrp = ncfile.createGroup('metadata')
+        self._store_dict_in_netcdf(ncgrp, self.metadata)
         return
+
+    def _restore_metadata(self, ncfile):
+        """
+        Restore metadata from NetCDF file.
+
+        Parameters
+        ----------
+        ncfile : netcdf.Dataset
+            The NetCDF file in which metadata is to be stored.
+
+        """
+        self.metadata = None
+        if 'metadata' in ncfile.groups:
+            ncgrp = ncfile.groups['metadata']
+            self.metadata = self._restore_dict_from_netcdf(ncgrp)
 
     def _resume_from_netcdf(self):
         """
         Resume execution by reading current positions and energies from a NetCDF file.
 
         """
+
+        # Check to make sure file exists.
+        if not os.path.exists(self.store_filename):
+            raise Exception("Store file %s does not exist." % self.store_filename)
 
         # Open NetCDF file for reading
         logger.debug("Reading NetCDF file '%s'..." % self.store_filename)
@@ -2034,6 +2163,7 @@ class ReplicaExchange(object):
         self.iteration = ncfile.variables['positions'].shape[0] - 1
         self.nstates = ncfile.variables['positions'].shape[1]
         self.natoms = ncfile.variables['positions'].shape[2]
+        self.nreplicas = self.nstates
         logger.debug("iteration = %d, nstates = %d, natoms = %d" % (self.iteration, self.nstates, self.natoms))
 
         # Restore positions.
@@ -2321,6 +2451,9 @@ class ReplicaExchange(object):
            dDelta_s_ij[i,j] is estimated standard error of Delta_s_ij[i,j]
 
         """
+        if not self._initialized:
+            self._initialize_resume()
+
         # Update analysis on root node.
         self._analysis()
 
@@ -2600,4 +2733,3 @@ class HamiltonianExchange(ReplicaExchange):
 if __name__ == "__main__":
     import doctest
     doctest.testmod()
-

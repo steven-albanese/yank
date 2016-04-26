@@ -2,6 +2,9 @@ package:
   name: yank-dev
   version: !!str 0.0.0
 
+source:
+  path: ../..
+
 build:
   preserve_egg_dir: True
   number: 0
@@ -15,13 +18,16 @@ requirements:
     - setuptools
     - netcdf4
     - openmm-dev
-    - openmmtools
-    - pymbar ==2.1.0b0
+    - mdtraj 1.5.1 # TODO remove me when segment_id bug is fixed (this is installed through openmoltools)
+    - openmmtools-dev
+    - pymbar-dev
     - ambermini
     - docopt
-    - openmoltools
-    - jinja2
+    - openmoltools-dev
     - sphinxcontrib-bibtex
+    - alchemy-dev
+    #- gcc 4.8.2 # [linux]
+    #- gcc 4.8.2 # [osx]
 
   run:
     - python
@@ -31,31 +37,29 @@ requirements:
     - cython
     - netcdf4
     - openmm-dev
-    - openmmtools
-    - pymbar ==2.1.0b0
+    - mdtraj 1.5.1 # TODO remove me when segment_id bug is fixed (this is installed through openmoltools)
+    - openmmtools-dev
+    - pymbar-dev
     - ambermini
     - docopt
-    - openmoltools
+    - openmoltools-dev
     - mpi4py
     - pyyaml
-    - jinja2
     - clusterutils
     - sphinxcontrib-bibtex
+    - alchemy-dev
+    #- libgcc
 
 test:
   requires:
     - nose
+    - nose-timer
+    - openmmtools-dev
   imports:
     - yank
   commands:
-    - nosetests yank --nocapture --verbosity=2 --with-doctest -a '!slow' --processes=2 --process-timeout=500
-    - which yank
     - yank --help
 
 about:
   home: https://github.com/choderalab/yank
   license: GNU Lesser General Public License v2 or later (LGPLv2+)
-
-
-
-
